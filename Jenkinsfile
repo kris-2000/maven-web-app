@@ -19,14 +19,45 @@ pipeline {
             }
         }
 
-        stage('3. Build Docker Image') {
+        stage('3. SonarQube SAST Scan') {
             steps {
-                sh "docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} -t ${DOCKER_IMAGE}:latest ."
+                withSonarQubeEnv('SonarQube-Server') {
+                    sh 'mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar'
+                }
             }
         }
 
-        stage('4. Push to Docker Hub') {
+        stage('4. Quality Gate Check') {
             steps {
+                timeout(time: 3, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('5. Nexus WAR Upload') {
+            steps {
+                nexusArtifactUploader(
+                    nexusVersion: 'nexus3',
+                    protocol: 'http',
+                    nexusUrl: '54.80.157.53:8081',
+                    groupId: 'org.scopeindia',
+                    version: '1.0-SNAPSHOT',
+                    repository: 'eks-maven-snapshots',
+                    credentialsId: 'nexus-creds',
+                    artifacts: [[
+                        artifactId: 'maven-web-app',
+                        classifier: '',
+                        file: 'target/maven-web-app.war',
+                        type: 'war'
+                    ]]
+                )
+            }
+        }
+
+        stage('6. Docker Build & Push') {
+            steps {
+                sh "docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} -t ${DOCKER_IMAGE}:latest ."
                 withCredentials([usernamePassword(
                     credentialsId: 'dockerhub-creds',
                     usernameVariable: 'DOCKER_USER',
@@ -42,12 +73,12 @@ pipeline {
             }
         }
 
-        stage('5. Deploy to AWS EKS') {
+        stage('7. Deploy & AutoScale on EKS') {
             steps {
                 sh '''
                     sed "s|IMAGE_TAG|${IMAGE_TAG}|g" k8s/deployment.yaml | kubectl apply -f -
                     kubectl rollout status deployment/maven-web-app --timeout=180s
-                    kubectl get pods,svc -o wide
+                    kubectl get pods,svc,hpa -o wide
                 '''
             }
         }
@@ -55,7 +86,7 @@ pipeline {
 
     post {
         success {
-            echo "Rollout Complete! Check EXTERNAL-IP in 'kubectl get svc maven-web-app-svc'."
+            echo "All 7 DevSecOps Stages Succeeded! App live on AWS EKS with HPA Auto Scaling."
         }
         always {
             sh 'docker image prune -f || true'
